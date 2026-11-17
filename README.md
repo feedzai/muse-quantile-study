@@ -9,7 +9,7 @@ updates, demonstrated end to end on the public [Bank Account Fraud
 
 Downstream systems often convert a model's score into an action using a
 fixed, manually chosen threshold (e.g. "flag anything scoring above 0.7").
-These thresholds, in fraud detection, are chosen to mantain a desired
+These thresholds, in fraud detection, are chosen to maintain a desired
 alert rate (percentage of flagged events), based on analyst capacity.
 Whenever the model behind that score is retrained or replaced, its raw
 score distribution usually shifts, even if predictive quality stays the
@@ -148,12 +148,90 @@ running `scripts/run_experiment.py`) for the full sweep's plots (a
 model-update box plot, a calibration-only box plot, and a fixed-threshold
 alert-rate bar chart, per variant).
 
+## Baseline: label-based recalibration
+
+`scripts/run_label_baseline.py` compares quantile mapping (no labels)
+against recalibrating the model with fraud labels — Platt scaling
+(logistic regression on the logit of the score) or isotonic regression —
+which is what a client with labels could do instead. Same models, training
+window and months as above. The client fixes its thresholds once, in
+probability space, on month 2 (old model, calibrated on month-2 labels, so
+that they hit the target alert rates). After the update, the new model is
+recalibrated on the most recent labeled month available given a label delay
+`d` (month `t-1-d`), and the client's thresholds are kept. `p2` refits its
+mapping on the month before, from scores alone.
+
+All numbers below are medians over the 3 variants × 3 seeds × eval
+months 5–7 (the months every delay can evaluate; 27 evaluations per cell).
+`p1` is the old model before the update; every other column serves the new
+model.
+
+**Alert-rate relative error (%)**: median absolute error, with the median
+signed error in parentheses (+ alerts more, − alerts less than the
+reference distribution prescribes). The two differ because the median of
+the absolute errors is not the absolute value of the median error.
+
+| Threshold | `p1` (old) | `p1_5` (no refit) | `p2` (quantile mapping) | Platt, d=1 | Platt, d=2 | Isotonic, d=1 | Isotonic, d=2 |
+|---|---|---|---|---|---|---|---|
+| `>= 0.2` | 3.1 (+1.6) | 65.1 (−65.1) | **2.4** (−2.4) | 12.6 (−0.5) | 13.7 (−4.0) | 9.5 (−8.4) | 13.0 (−3.9) |
+| `>= 0.5` | 8.4 (+8.4) | 59.8 (−59.8) | **8.6** (−8.6) | 20.2 (+8.1) | 20.8 (+5.7) | 26.7 (+22.0) | 23.6 (+6.0) |
+| `>= 0.6` | 23.7 (+23.7) | 37.8 (−37.8) | **17.7** (−10.7) | 21.8 (+12.5) | 19.6 (+15.4) | 24.4 (+14.3) | 28.1 (+9.4) |
+| `>= 0.8` | 31.2 (+31.2) | 18.9 (−18.9) | 23.2 (−12.7) | 24.8 (+16.2) | **18.2** (+12.0) | 35.6 (+35.6) | 24.5 (+20.2) |
+
+Among the predictors that serve the new model, quantile mapping has the
+lowest median absolute error at `>= 0.2`, `>= 0.5` and `>= 0.6`; at
+`>= 0.8`, Platt with a two-month delay (18.2%) and `p1_5` (18.9%) are
+lower than `p2` (23.2%). Recalibration with no label delay (`d=0`, not
+available in production) is no better (median 11–45% for Platt, 11–70%
+for isotonic). Recalibration keeps scores interpretable as fraud
+probabilities, but a fixed probability threshold does not fix the alert
+volume when the model changes: a better-separating model puts a different
+share of events above the same probability, and the recalibrated models
+alert more than the reference from `>= 0.5` up. Platt is monotone, so
+`recal_platt_old` and `recal_platt_stale` reproduce `p1` and `p1_5`
+exactly — a check on the setup.
+
+These months (5–7) are a subset of the walk-forward evaluation above, and
+the models and mappings are the same: over all eval months (3–7), `Base`
+alone, the signed errors of `p1`, `p1_5` and `p2` match the per-edge
+table above. Months 5–7 are harder for `p2` than months 3–4 (for `Base`,
+`p2` under-alerts by 17–36% at `>= 0.5`–`>= 0.8` in months 5–7), so its
+error here is larger than in the first table.
+
+**Precision and recall at the client's fixed thresholds** (recall /
+precision):
+
+| Threshold | `p1` (old) | `p1_5` (no refit) | `p2` (quantile mapping) | Platt, d=1 | Platt, d=2 | Isotonic, d=1 | Isotonic, d=2 |
+|---|---|---|---|---|---|---|---|
+| `>= 0.2` | 0.984 / 0.017 | 0.828 / 0.039 | 0.980 / 0.017 | 0.982 / 0.019 | 0.980 / 0.017 | 0.971 / 0.020 | 0.979 / 0.016 |
+| `>= 0.5` | 0.906 / 0.030 | 0.707 / 0.059 | 0.867 / 0.034 | 0.890 / 0.032 | 0.899 / 0.029 | 0.901 / 0.030 | 0.909 / 0.030 |
+| `>= 0.6` | 0.666 / 0.068 | 0.528 / 0.098 | 0.558 / 0.077 | 0.650 / 0.077 | 0.634 / 0.069 | 0.638 / 0.078 | 0.640 / 0.076 |
+| `>= 0.8` | 0.512 / 0.100 | 0.432 / 0.124 | 0.388 / 0.113 | 0.486 / 0.114 | 0.468 / 0.105 | 0.512 / 0.109 | 0.511 / 0.104 |
+
+At a fixed threshold, recall and precision follow the alert volume, not
+only the model. `p1` and the recalibrated models alert more than the
+reference from `>= 0.5` up (at `>= 0.6` and `>= 0.8`, `p1` alerts more
+than `p2` in every evaluation), so they catch more fraud at lower
+precision; `p2`'s lower recall there comes from alerting less, not from a
+worse model. `p1_5` and `p2` share the same model: evaluation by
+evaluation, `p1_5` only has higher recall than `p2` when it alerts more
+(about a third of the evaluations at `>= 0.8`); its higher median there is
+an artifact of taking medians over different evaluations. To compare the
+models themselves, fix the false-positive rate instead (e.g., recall at
+1% FPR): each model then gets its own threshold, and a monotone mapping
+such as quantile mapping or Platt does not change the result.
+
+Full results: `results/label_baseline/summary_months5-7.csv`,
+`summary_all_months.csv` and `per_step.csv`. Every number in this section
+is reproduced by `scripts/run_label_baseline.py`.
+
 ## Repository layout
 
 ```
 src/muse/
     quantile_mapping.py       percentile-fit quantile mapping against a target alert-rate curve
     posterior_correction.py   undersampling-bias correction
+    recalibration.py          label-based recalibration baseline (Platt / isotonic)
     data.py                   BAF loading (via kagglehub)
     models.py                 LightGBM training with majority-class undersampling
     experiment.py             walk-forward driver + p1/p1_5/p2/custom/default/raw orchestration
@@ -162,11 +240,13 @@ scripts/
     download_data.py            one-time BAF download
     run_experiment.py           end-to-end CLI run across variants/seeds, writes results/<variant>/ + figures
     check_model_divergence.py   reproduces the old/new score correlation numbers quoted in this README
+    run_label_baseline.py       label-based recalibration baseline vs quantile mapping, writes results/label_baseline/
 notebooks/
     results.ipynb             a single-variant, single-seed walkthrough, with narrative and plots
 tests/
     test_quantile_mapping.py  unit tests for the transform itself
     test_experiment.py        correctness properties on synthetic data
+    test_recalibration.py     unit tests for the recalibration baseline
 ```
 
 ## Running it
@@ -181,6 +261,7 @@ uv run python scripts/download_data.py       # downloads BAF via kagglehub (~530
 uv run python scripts/run_experiment.py --variant Base --seeds 0
 uv run python scripts/run_experiment.py --variant Base "Variant II" "Variant IV" --seeds 0 1 2
 uv run python scripts/check_model_divergence.py   # reproduce the old/new score correlation numbers
+uv run python scripts/run_label_baseline.py --data-dir <dir with the BAF CSVs>   # label-based recalibration baseline
 uv run jupyter nbconvert --to notebook --execute --inplace notebooks/results.ipynb
 ```
 
